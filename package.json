@@ -1,0 +1,28 @@
+{
+  "name": "opencode-cursor-auth",
+  "version": "1.0.0",
+  "description": "Authentication provider for Cursor, extracting credentials from local environment or agent.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "cursor",
+    "auth",
+    "opencode"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}

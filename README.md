@@ -8,40 +8,48 @@ It supports extracting tokens from:
 
 ## Quick Start
 
-If you don't have Cursor installed or configured, run the setup script:
+### 1. Setup Cursor Credentials
+If you don't have Cursor installed or configured, run the setup script to generate credentials:
 
 ```bash
 ./setup-cursor-auth.sh
 ```
 
-This script will:
-1.  Install Cursor (if missing).
-2.  Trigger the `cursor-agent login` flow (opens browser).
-3.  Verify the token extraction works.
+### 2. Configure OpenCode
+Add the plugin to your `~/.config/opencode/opencode.json` (or project config):
 
-## Usage
-
-```typescript
-import { getCursorAuth } from "opencode-cursor-auth";
-
-const auth = await getCursorAuth();
-
-if (auth.type === "success" && auth.token) {
-  console.log("Access Token:", auth.token.accessToken);
-  console.log("Source:", auth.source); // "local" (IDE) or "agent" (CLI)
+```json
+{
+  "plugin": ["opencode-cursor-auth"],
+  "provider": {
+    "cursor": {
+      "options": {}
+    }
+  }
 }
 ```
 
-## How it works
+## Authentication
 
-The library attempts to find authentication tokens in the following order:
-1.  **Local IDE Storage**: Checks `state.vscdb` in standard Cursor paths.
-2.  **Agent Configuration**: Checks `auth.json` in `~/.config/cursor/` (Linux), `~/.cursor/` (Mac), or `%APPDATA%` (Windows).
+Run the OpenCode login command:
+
+```bash
+opencode auth login
+```
+
+Select **"Local Cursor Installation / Agent"**. This will verify your local credentials.
+
+## Usage
+
+You can now use Cursor as a provider in your OpenCode commands (assuming a model mapping exists):
+
+```bash
+opencode run "Hello world" --model=cursor/gpt-4
+```
 
 ## Dependencies
 
 -   `better-sqlite3`: For reading the IDE database.
--   `zod`: For validation (optional/future).
 
 ## License
 

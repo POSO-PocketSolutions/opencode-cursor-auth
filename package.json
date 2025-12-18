@@ -21,6 +21,8 @@
     "zod": "^3.24.1"
   },
   "devDependencies": {
+    "@opencode-ai/plugin": "^1.0.168",
+    "@opencode-ai/sdk": "^1.0.168",
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.10.2",
     "typescript": "^5.7.2"

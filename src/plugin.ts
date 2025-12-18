@@ -6,7 +6,7 @@ export const CursorAuthPlugin: Plugin = async (_input: PluginInput) => {
   return {
     auth: {
       provider: CURSOR_PROVIDER_ID,
-      async loader(_getAuth, _provider) {
+      async loader(_getAuth: any, _provider: any) {
         // Attempt to get auth immediately
         const result = await getCursorAuth();
 
@@ -24,9 +24,6 @@ export const CursorAuthPlugin: Plugin = async (_input: PluginInput) => {
             const headers = new Headers(init?.headers);
             headers.set("Authorization", `Bearer ${accessToken}`);
             
-            // Cursor-specific headers might be needed, e.g.
-            // headers.set("User-Agent", "Cursor/0.1.0");
-
             const requestInit: RequestInit = {
               ...init,
               headers,
@@ -39,20 +36,21 @@ export const CursorAuthPlugin: Plugin = async (_input: PluginInput) => {
       methods: [
         {
           label: "Local Cursor Installation / Agent",
-          type: "local", // Using 'local' type as it doesn't fit standard 'oauth' or 'api' perfectly
+          type: "api",
           authorize: async () => {
              // This method is called when the user explicitly requests login via opencode CLI
              const result = await getCursorAuth();
              if (result.type === "success" && result.token) {
                  return {
                      type: "success",
-                     // We can return the token here if the interface expects it, 
-                     // but usually 'local' methods just verify presence.
+                     // Return the access token as the 'key'
+                     key: result.token.accessToken
                  };
              }
              return {
-                 type: "failed",
-                 error: result.error || "Could not find local Cursor credentials."
+                 type: "failed"
+                 // Note: The interface might not accept 'error' string in failed state based on error msg
+                 // "{ type: "failed"; }"
              };
           }
         },

@@ -12,15 +12,17 @@ It supports extracting tokens from:
 If you don't have Cursor installed or configured, run the setup script to generate credentials:
 
 ```bash
+git clone https://github.com/POSO-PocketSolutions/opencode-cursor-auth.git
+cd opencode-cursor-auth
 ./setup-cursor-auth.sh
 ```
 
 ### 2. Configure OpenCode
-Add the plugin to your `~/.config/opencode/opencode.json` (or project config):
+Add the plugin to your `~/.config/opencode/opencode.json` (or project config). Since this package is hosted on GitHub, use the git syntax:
 
 ```json
 {
-  "plugin": ["opencode-cursor-auth"],
+  "plugin": ["github:POSO-PocketSolutions/opencode-cursor-auth"],
   "provider": {
     "cursor": {
       "options": {}

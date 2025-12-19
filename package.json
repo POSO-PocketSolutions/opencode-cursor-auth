@@ -1,6 +1,6 @@
 {
   "name": "opencode-cursor-auth",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Authentication provider for Cursor, extracting credentials from local environment or agent.",
   "type": "module",
   "main": "dist/index.js",

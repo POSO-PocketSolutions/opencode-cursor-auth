@@ -1,5 +1,3 @@
-import type { AuthStrategy, CursorAuthResult } from "./types.js";
-export declare class AgentAuthStrategy implements AuthStrategy {
-    login(): Promise<CursorAuthResult>;
-}
+import type { CursorAuthResult } from "./types.js";
+export declare function loginAgent(): Promise<CursorAuthResult>;
 //# sourceMappingURL=agent.d.ts.map

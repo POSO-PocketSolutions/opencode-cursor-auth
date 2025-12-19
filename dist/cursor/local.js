@@ -3,10 +3,10 @@ import { getDbValue } from "../utils/db.js";
 import { decodeJWT } from "../utils/jwt.js";
 export async function loginLocal() {
     const dbPath = getCursorStateDbPath();
-    const accessToken = getDbValue(dbPath, "cursorAuth/accessToken");
-    const refreshToken = getDbValue(dbPath, "cursorAuth/refreshToken");
+    const accessToken = await getDbValue(dbPath, "cursorAuth/accessToken");
+    const refreshToken = await getDbValue(dbPath, "cursorAuth/refreshToken");
     // Sometimes email is stored separately
-    let email = getDbValue(dbPath, "cursorAuth/cachedEmail");
+    let email = await getDbValue(dbPath, "cursorAuth/cachedEmail");
     if (!accessToken) {
         return {
             type: "failed",

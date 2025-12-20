@@ -270,11 +270,11 @@ async function ensureCursorProxyServer(workspaceDirectory) {
             const created = Math.floor(Date.now() / 1000);
             const sse = new ReadableStream({
                 async start(controller) {
+                    let closed = false;
                     try {
                         // Tool-calling + streaming: buffer stdout to decide whether to emit tool_calls.
                         if (tools.length) {
                             // Keep the SSE connection alive while cursor-agent thinks.
-                            let closed = false;
                             const heartbeat = () => {
                                 if (closed)
                                     return;

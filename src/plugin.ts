@@ -321,7 +321,6 @@ async function ensureCursorProxyServer(workspaceDirectory: string): Promise<void
       });
     }
 
-    // Streaming: forward stdout as SSE deltas.
     const encoder = new TextEncoder();
     const decoder = new TextDecoder();
     const id = `cursor-agent-${Date.now()}`;
@@ -330,6 +329,60 @@ async function ensureCursorProxyServer(workspaceDirectory: string): Promise<void
     const sse = new ReadableStream({
       async start(controller) {
         try {
+          // Tool-calling with streaming: buffer stdout, then emit tool_call or final chunks.
+          if (tools.length) {
+            const stdoutText = await new Response(child.stdout).text();
+            const stderrText = await new Response(child.stderr).text();
+
+            if (child.exitCode !== 0) {
+              const errChunk = { error: "cursor-agent failed.", details: stderrText || stdoutText };
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(errChunk)}\n\n`));
+              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+              return;
+            }
+
+            const plan = parseToolCallPlan(stdoutText.trim());
+            if (plan?.action === "tool_call") {
+              const toolCalls = plan.tool_calls.map((tc, i) => ({
+                index: i,
+                id: `call_${Date.now()}_${i}`,
+                type: "function",
+                function: {
+                  name: tc.name,
+                  arguments: JSON.stringify(tc.arguments ?? {}),
+                },
+              }));
+
+              const chunk = {
+                id,
+                object: "chat.completion.chunk",
+                created,
+                model: selectedModel,
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      role: "assistant",
+                      tool_calls: toolCalls,
+                    },
+                    finish_reason: "tool_calls",
+                  },
+                ],
+              };
+
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+              return;
+            }
+
+            const content = plan?.action === "final" ? plan.content : stdoutText.trim();
+            const chunk = createChatCompletionChunk(id, created, selectedModel, content, true);
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            return;
+          }
+
+          // Streaming (no tools): forward stdout incrementally.
           const reader = (child.stdout as ReadableStream<Uint8Array>).getReader();
           while (true) {
             const { value, done } = await reader.read();
@@ -343,7 +396,6 @@ async function ensureCursorProxyServer(workspaceDirectory: string): Promise<void
             }
           }
 
-          // Ensure the process ended; if it failed, include stderr in a final error.
           if (child.exitCode !== 0) {
             const stderrText = await new Response(child.stderr).text();
             const errChunk = {

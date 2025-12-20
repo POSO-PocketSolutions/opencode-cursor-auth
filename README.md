@@ -65,10 +65,18 @@ opencode run "decime hola" --model cursor/gpt-5.2
 - OpenCode uses `@ai-sdk/openai-compatible` against `http://127.0.0.1:32123/v1`.
 - The proxy translates `/v1/chat/completions` into a `cursor-agent` CLI call.
 
+## Current Limitations
+
+This integration is intentionally minimal and works well for plain chat/completions, but it does not currently provide:
+
+- **OpenCode tool-calling (LSP/TODO/tools):** `cursor-agent` is a CLI agent and does not speak OpenAI tool-calls, so OpenCode can’t route tool calls.
+- **Token usage / cost accounting:** `cursor-agent` does not expose token counts per request in a way OpenCode can consume.
+- **“Thinking” UI sections:** we only stream assistant text; there’s no separate reasoning payload.
+
 ## Troubleshooting
 
 - `Unauthorized: cursor-agent failed.`: your model name is not supported by your `cursor-agent`. Try `cursor/gpt-5.2` or `cursor/auto`.
-- `Unable to connect`: the proxy port `32123` might be in use. Change it in both the plugin (port constant) and `opencode.json`.
+- `Unable to connect`: another `opencode` instance might not have the proxy running, or the port `32123` is taken by something else. Try closing other `opencode` sessions, or change the port in both the plugin and `opencode.json`.
 
 ## License
 

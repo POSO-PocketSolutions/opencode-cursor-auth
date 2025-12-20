@@ -1,4 +1,4 @@
-const CURSOR_PROVIDER_ID = "cursor";
+const CURSOR_PROVIDER_ID = "opencode-cursor";
 const CURSOR_AGENT_BASE_URL = "http://cursor-agent.local";
 function extractPromptFromChatCompletions(body) {
     const model = typeof body?.model === "string" ? body.model : undefined;

@@ -1,7 +1,7 @@
 import type { Plugin, PluginInput } from "@opencode-ai/plugin";
 import type { Auth } from "@opencode-ai/sdk";
 
-const CURSOR_PROVIDER_ID = "cursor";
+const CURSOR_PROVIDER_ID = "opencode-cursor";
 const CURSOR_AGENT_BASE_URL = "http://cursor-agent.local";
 
 function extractPromptFromChatCompletions(body: any): { prompt: string; model?: string; stream: boolean } {

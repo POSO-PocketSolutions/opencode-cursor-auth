@@ -13,15 +13,38 @@ function normalizeCursorAgentModel(model) {
     };
     return aliases[model] || model;
 }
+function summarizeTool(tool) {
+    const name = tool?.function?.name || "unknown";
+    const description = tool?.function?.description || "";
+    const params = tool?.function?.parameters;
+    let paramsSummary = "";
+    if (params && typeof params === "object") {
+        const props = params.properties && typeof params.properties === "object" ? Object.keys(params.properties) : [];
+        const required = Array.isArray(params.required) ? params.required : [];
+        paramsSummary = `args: { ${props.join(", ")} } required: [${required.join(", ")}]`;
+    }
+    return `- ${name}${description ? `: ${description}` : ""}${paramsSummary ? ` (${paramsSummary})` : ""}`;
+}
 function extractPromptFromChatCompletions(body) {
     const model = typeof body?.model === "string" ? body.model : undefined;
     const stream = body?.stream === true;
-    const messages = Array.isArray(body?.messages)
-        ? body.messages
-        : [];
+    const tools = Array.isArray(body?.tools) ? body.tools : [];
+    const messages = Array.isArray(body?.messages) ? body.messages : [];
     const lines = [];
     for (const message of messages) {
         const role = typeof message.role === "string" ? message.role : "user";
+        if (role === "tool") {
+            const name = typeof message.name === "string" ? message.name : "tool";
+            const toolCallId = typeof message.tool_call_id === "string" ? message.tool_call_id : "";
+            const content = typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "");
+            lines.push(`TOOL RESULT (${name}${toolCallId ? `, id=${toolCallId}` : ""}): ${content}`);
+            continue;
+        }
+        if (role === "assistant" && Array.isArray(message.tool_calls)) {
+            // In case OpenCode includes previous tool_calls.
+            lines.push(`ASSISTANT TOOL_CALLS: ${JSON.stringify(message.tool_calls)}`);
+            continue;
+        }
         const content = message.content;
         if (typeof content === "string") {
             lines.push(`${role.toUpperCase()}: ${content}`);
@@ -43,7 +66,53 @@ function extractPromptFromChatCompletions(body) {
             continue;
         }
     }
-    return { prompt: lines.join("\n\n"), model, stream };
+    return { prompt: lines.join("\n\n"), model, stream, tools };
+}
+function parseToolCallPlan(output) {
+    // Best-effort: find JSON object in the output.
+    const start = output.indexOf("{");
+    const end = output.lastIndexOf("}");
+    if (start === -1 || end === -1 || end <= start)
+        return null;
+    const jsonText = output.slice(start, end + 1);
+    try {
+        const parsed = JSON.parse(jsonText);
+        if (parsed && parsed.action === "final" && typeof parsed.content === "string") {
+            return { action: "final", content: parsed.content };
+        }
+        if (parsed && parsed.action === "tool_call" && Array.isArray(parsed.tool_calls)) {
+            return {
+                action: "tool_call",
+                tool_calls: parsed.tool_calls
+                    .filter((t) => t && typeof t.name === "string")
+                    .map((t) => ({ name: t.name, arguments: t.arguments ?? {} })),
+            };
+        }
+        return null;
+    }
+    catch {
+        return null;
+    }
+}
+function buildToolCallingPrompt(conversation, tools) {
+    const toolList = tools.length ? tools.map(summarizeTool).join("\n") : "(none)";
+    return [
+        "You are a tool-calling assistant running inside OpenCode.",
+        "You can call tools when needed to answer the user.",
+        "",
+        "Available tools:",
+        toolList,
+        "",
+        "IMPORTANT RESPONSE FORMAT:",
+        "Return ONLY one JSON object (no markdown, no extra text).",
+        "If you want to call tool(s):",
+        '{"action":"tool_call","tool_calls":[{"name":"tool_name","arguments":{}}]}',
+        "If you want to answer the user directly:",
+        '{"action":"final","content":"..."}',
+        "",
+        "Conversation:",
+        conversation,
+    ].join("\n");
 }
 function createChatCompletionResponse(model, content) {
     return {
@@ -60,10 +129,25 @@ function createChatCompletionResponse(model, content) {
         ],
     };
 }
+function createChatCompletionChunk(id, created, model, deltaContent, done = false) {
+    return {
+        id,
+        object: "chat.completion.chunk",
+        created,
+        model,
+        choices: [
+            {
+                index: 0,
+                delta: deltaContent ? { content: deltaContent } : {},
+                finish_reason: done ? "stop" : null,
+            },
+        ],
+    };
+}
 function getGlobalKey() {
     return "__opencode_cursor_proxy_server__";
 }
-async function ensureCursorProxyServer($, workspaceDirectory) {
+async function ensureCursorProxyServer(workspaceDirectory) {
     const key = getGlobalKey();
     const g = globalThis;
     if (g[key]?.started) {
@@ -72,6 +156,12 @@ async function ensureCursorProxyServer($, workspaceDirectory) {
     g[key] = { started: true };
     const handler = async (req) => {
         const url = new URL(req.url);
+        if (url.pathname === "/health") {
+            return new Response(JSON.stringify({ ok: true }), {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+            });
+        }
         if (url.pathname !== "/v1/chat/completions" && url.pathname !== "/chat/completions") {
             return new Response(JSON.stringify({ error: `Unsupported path: ${url.pathname}` }), {
                 status: 404,
@@ -79,46 +169,135 @@ async function ensureCursorProxyServer($, workspaceDirectory) {
             });
         }
         const body = await req.json().catch(() => ({}));
-        const { prompt, model, stream } = extractPromptFromChatCompletions(body);
+        const { prompt, model, stream, tools } = extractPromptFromChatCompletions(body);
         const selectedModel = normalizeCursorAgentModel(model);
-        const command = $ `cursor-agent --print --output-format text --workspace ${workspaceDirectory} --model ${selectedModel} ${prompt}`
-            .quiet()
-            .nothrow();
-        const result = await command;
-        const stdout = result.text();
-        const stderr = result.stderr.toString();
-        if (result.exitCode !== 0) {
-            return new Response(JSON.stringify({
-                error: "cursor-agent failed.",
-                details: stderr || stdout,
-            }), { status: 401, headers: { "Content-Type": "application/json" } });
+        // If tools are provided, ask cursor-agent to output a JSON plan (final vs tool_call).
+        const effectivePrompt = tools.length ? buildToolCallingPrompt(prompt, tools) : prompt;
+        // Note: cursor-agent expects the prompt as a positional arg.
+        // This is a best-effort adapter; we don’t currently support tool-calling.
+        const cmd = [
+            "cursor-agent",
+            "--print",
+            "--output-format",
+            "text",
+            "--workspace",
+            workspaceDirectory,
+            "--model",
+            selectedModel,
+            effectivePrompt,
+        ];
+        const bunAny = globalThis;
+        if (!bunAny.Bun?.spawn) {
+            return new Response(JSON.stringify({ error: "This provider requires Bun runtime." }), {
+                status: 500,
+                headers: { "Content-Type": "application/json" },
+            });
         }
-        const payload = createChatCompletionResponse(selectedModel, stdout.trim());
+        const child = bunAny.Bun.spawn({
+            cmd,
+            stdout: "pipe",
+            stderr: "pipe",
+            env: bunAny.Bun.env,
+        });
+        // Non-streaming: buffer stdout/stderr.
         if (!stream) {
+            const [stdoutBytes, stderrBytes] = await Promise.all([
+                new Response(child.stdout).arrayBuffer(),
+                new Response(child.stderr).arrayBuffer(),
+            ]);
+            const stdout = new TextDecoder().decode(stdoutBytes).trim();
+            const stderr = new TextDecoder().decode(stderrBytes).trim();
+            if (child.exitCode !== 0) {
+                return new Response(JSON.stringify({ error: "cursor-agent failed.", details: stderr || stdout }), {
+                    status: 401,
+                    headers: { "Content-Type": "application/json" },
+                });
+            }
+            // Tool-calling support (non-streaming).
+            if (tools.length) {
+                const plan = parseToolCallPlan(stdout);
+                if (plan?.action === "tool_call") {
+                    const toolCalls = plan.tool_calls.map((tc, i) => ({
+                        id: `call_${Date.now()}_${i}`,
+                        type: "function",
+                        function: {
+                            name: tc.name,
+                            arguments: JSON.stringify(tc.arguments ?? {}),
+                        },
+                    }));
+                    const payload = {
+                        id: `cursor-agent-${Date.now()}`,
+                        object: "chat.completion",
+                        created: Math.floor(Date.now() / 1000),
+                        model: selectedModel,
+                        choices: [
+                            {
+                                index: 0,
+                                message: {
+                                    role: "assistant",
+                                    content: "",
+                                    tool_calls: toolCalls,
+                                },
+                                finish_reason: "tool_calls",
+                            },
+                        ],
+                    };
+                    return new Response(JSON.stringify(payload), {
+                        status: 200,
+                        headers: { "Content-Type": "application/json" },
+                    });
+                }
+                if (plan?.action === "final") {
+                    const payload = createChatCompletionResponse(selectedModel, plan.content);
+                    return new Response(JSON.stringify(payload), {
+                        status: 200,
+                        headers: { "Content-Type": "application/json" },
+                    });
+                }
+            }
+            const payload = createChatCompletionResponse(selectedModel, stdout);
             return new Response(JSON.stringify(payload), {
                 status: 200,
                 headers: { "Content-Type": "application/json" },
             });
         }
+        // Streaming: forward stdout as SSE deltas.
         const encoder = new TextEncoder();
+        const decoder = new TextDecoder();
+        const id = `cursor-agent-${Date.now()}`;
+        const created = Math.floor(Date.now() / 1000);
         const sse = new ReadableStream({
-            start(controller) {
-                const chunk = {
-                    id: payload.id,
-                    object: "chat.completion.chunk",
-                    created: payload.created,
-                    model: payload.model,
-                    choices: [
-                        {
-                            index: 0,
-                            delta: { content: payload.choices[0].message.content },
-                            finish_reason: "stop",
-                        },
-                    ],
-                };
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-                controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-                controller.close();
+            async start(controller) {
+                try {
+                    const reader = child.stdout.getReader();
+                    while (true) {
+                        const { value, done } = await reader.read();
+                        if (done)
+                            break;
+                        if (!value || value.length === 0)
+                            continue;
+                        const text = decoder.decode(value, { stream: true });
+                        if (text) {
+                            const chunk = createChatCompletionChunk(id, created, selectedModel, text, false);
+                            controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                        }
+                    }
+                    // Ensure the process ended; if it failed, include stderr in a final error.
+                    if (child.exitCode !== 0) {
+                        const stderrText = await new Response(child.stderr).text();
+                        const errChunk = {
+                            error: "cursor-agent failed.",
+                            details: stderrText,
+                        };
+                        controller.enqueue(encoder.encode(`data: ${JSON.stringify(errChunk)}\n\n`));
+                    }
+                    const doneChunk = createChatCompletionChunk(id, created, selectedModel, "", true);
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(doneChunk)}\n\n`));
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                }
+                finally {
+                    controller.close();
+                }
             },
         });
         return new Response(sse, {
@@ -131,25 +310,37 @@ async function ensureCursorProxyServer($, workspaceDirectory) {
         });
     };
     if (typeof globalThis.Bun !== "undefined" && typeof globalThis.Bun.serve === "function") {
-        globalThis.Bun.serve({
-            hostname: CURSOR_PROXY_HOST,
-            port: CURSOR_PROXY_PORT,
-            fetch: handler,
-        });
-        return;
+        // If another opencode instance already started the proxy, reuse it.
+        try {
+            const res = await fetch(`http://${CURSOR_PROXY_HOST}:${CURSOR_PROXY_PORT}/health`).catch(() => null);
+            if (res && res.ok) {
+                return;
+            }
+        }
+        catch {
+            // ignore
+        }
+        try {
+            globalThis.Bun.serve({
+                hostname: CURSOR_PROXY_HOST,
+                port: CURSOR_PROXY_PORT,
+                fetch: handler,
+            });
+            return;
+        }
+        catch (error) {
+            const code = error?.code;
+            if (code === "EADDRINUSE") {
+                // Assume an existing proxy is running.
+                return;
+            }
+            throw error;
+        }
     }
-    // Fallback (shouldn't happen inside opencode, which runs Bun).
     throw new Error("Cursor proxy server requires Bun runtime");
 }
 export const CursorAuthPlugin = async ({ $, directory }) => {
-    await ensureCursorProxyServer($, directory);
-    // We still provide a fetch override (best-effort), but the primary integration is the local HTTP proxy.
-    const cursorFetch = async (input, init) => {
-        const urlString = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-        const url = new URL(urlString);
-        const target = new URL(url.pathname, CURSOR_PROXY_BASE_URL);
-        return fetch(target, init);
-    };
+    await ensureCursorProxyServer(directory);
     return {
         auth: {
             provider: CURSOR_PROVIDER_ID,
@@ -176,6 +367,7 @@ export const CursorAuthPlugin = async ({ $, directory }) => {
                         }
                         return {
                             type: "success",
+                            // Sentinel key (OpenCode expects an API key).
                             key: "cursor-agent",
                         };
                     },
@@ -188,9 +380,7 @@ export const CursorAuthPlugin = async ({ $, directory }) => {
             }
             // Ensure AI SDK has a base URL to build request URLs.
             output.options.baseURL = output.options.baseURL || CURSOR_PROXY_BASE_URL;
-            // Override transport so we call cursor-agent instead of HTTP.
-            output.options.fetch = cursorFetch;
-            // apiKey is required by the OpenAI-compatible provider, but not used by cursorFetch.
+            // apiKey is required by the OpenAI-compatible provider, but not used by our proxy.
             output.options.apiKey = output.options.apiKey || "cursor-agent";
         },
     };

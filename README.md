@@ -1,57 +1,74 @@
 # opencode-cursor-auth
 
-Authentication provider for Cursor, extracting credentials from the local environment.
+Cursor authentication + local Cursor Agent backend for OpenCode.
 
-It supports extracting tokens from:
-1.  **Cursor IDE** (Local SQLite DB) - If you use the main editor.
-2.  **Cursor Agent** (JSON Config) - If you use the CLI/headless agent.
+This plugin lets you use `cursor-agent` as an OpenAI-compatible provider inside OpenCode (no Cursor IDE required).
 
-## Quick Start
+## Requirements
 
-### 1. Setup Cursor Credentials
-If you don't have Cursor installed or configured, run the setup script to generate credentials:
+- `cursor-agent` installed (`curl -fsSL https://cursor.com/install | bash`)
+- Logged in once (the plugin can trigger `cursor-agent login`)
 
-```bash
-git clone https://github.com/POSO-PocketSolutions/opencode-cursor-auth.git
-cd opencode-cursor-auth
-./setup-cursor-auth.sh
-```
+## Install
 
-### 2. Configure OpenCode
-Add the plugin to your `~/.config/opencode/opencode.json` (or project config). Since this package is hosted on GitHub, use the git syntax:
+Add the plugin to your OpenCode config (`~/.config/opencode/opencode.json`):
 
 ```json
 {
-  "plugin": ["github:POSO-PocketSolutions/opencode-cursor-auth"],
+  "plugin": [
+    "opencode-openai-codex-auth@4.1.0",
+    "opencode-gemini-auth",
+    "opencode-cursor-auth@1.0.9"
+  ],
   "provider": {
     "cursor": {
-      "options": {}
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Cursor Agent (local)",
+      "options": {
+        "baseURL": "http://127.0.0.1:32123/v1"
+      },
+      "models": {
+        "auto": { "name": "Cursor Agent Auto" },
+        "gpt-5": { "name": "Cursor Agent GPT-5 (alias → gpt-5.2)" },
+        "gpt-5.2": { "name": "Cursor Agent GPT-5.2" },
+        "gpt-5.1": { "name": "Cursor Agent GPT-5.1" },
+        "gpt-5.1-codex": { "name": "Cursor Agent GPT-5.1 Codex" },
+        "sonnet-4": { "name": "Cursor Agent Sonnet 4 (alias → sonnet-4.5)" },
+        "sonnet-4.5": { "name": "Cursor Agent Sonnet 4.5" },
+        "sonnet-4.5-thinking": { "name": "Cursor Agent Sonnet 4.5 Thinking" }
+      }
     }
   }
 }
 ```
 
-## Authentication
-
-Run the OpenCode login command:
+## Login
 
 ```bash
 opencode auth login
 ```
 
-Select **"Local Cursor Installation / Agent"**. This will verify your local credentials.
+- Select provider: `Other`
+- Provider id: `cursor`
+- Method: `Login via cursor-agent (opens browser)`
 
-## Usage
-
-You can now use Cursor as a provider in your OpenCode commands (assuming a model mapping exists):
+## Run
 
 ```bash
-opencode run "Hello world" --model=cursor/gpt-4
+opencode run "decime hola" --model cursor/gpt-5
+opencode run "decime hola" --model cursor/gpt-5.2
 ```
 
-## Dependencies
+## How It Works
 
--   `better-sqlite3`: For reading the IDE database.
+- On startup, the plugin starts a local HTTP proxy on `127.0.0.1:32123`.
+- OpenCode uses `@ai-sdk/openai-compatible` against `http://127.0.0.1:32123/v1`.
+- The proxy translates `/v1/chat/completions` into a `cursor-agent` CLI call.
+
+## Troubleshooting
+
+- `Unauthorized: cursor-agent failed.`: your model name is not supported by your `cursor-agent`. Try `cursor/gpt-5.2` or `cursor/auto`.
+- `Unable to connect`: the proxy port `32123` might be in use. Change it in both the plugin (port constant) and `opencode.json`.
 
 ## License
 

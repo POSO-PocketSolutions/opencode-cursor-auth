@@ -1,24 +1,29 @@
 # opencode-cursor-auth
 
-Cursor authentication + local Cursor Agent backend for OpenCode.
+Use `cursor-agent` inside OpenCode (CLI-first Cursor).
 
-This plugin lets you use `cursor-agent` as an OpenAI-compatible provider inside OpenCode (no Cursor IDE required).
+This plugin is for people who pay for Cursor (or have it paid for them) and want to use it from OpenCode instead of the Cursor UI.
 
 ## Requirements
 
-- `cursor-agent` installed (`curl -fsSL https://cursor.com/install | bash`)
-- Logged in once (the plugin can trigger `cursor-agent login`)
+- An active **Cursor Pro** subscription (or equivalent) so `cursor-agent` can access models.
+- `cursor-agent` installed.
 
 ## Install
 
-Add the plugin to your OpenCode config (`~/.config/opencode/opencode.json`):
+1) Install the plugin:
+
+```bash
+npm install opencode-cursor-auth
+```
+
+2) Add it to `~/.config/opencode/opencode.json`:
 
 ```json
 {
+  "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "opencode-openai-codex-auth@4.1.0",
-    "opencode-gemini-auth",
-    "opencode-cursor-auth@1.0.9"
+    "opencode-cursor-auth@1.0.16"
   ],
   "provider": {
     "cursor": {
@@ -33,7 +38,6 @@ Add the plugin to your OpenCode config (`~/.config/opencode/opencode.json`):
         "gpt-5.2": { "name": "Cursor Agent GPT-5.2" },
         "gpt-5.1": { "name": "Cursor Agent GPT-5.1" },
         "gpt-5.1-codex": { "name": "Cursor Agent GPT-5.1 Codex" },
-        "sonnet-4": { "name": "Cursor Agent Sonnet 4 (alias → sonnet-4.5)" },
         "sonnet-4.5": { "name": "Cursor Agent Sonnet 4.5" },
         "sonnet-4.5-thinking": { "name": "Cursor Agent Sonnet 4.5 Thinking" }
       }
@@ -56,27 +60,13 @@ opencode auth login
 
 ```bash
 opencode run "decime hola" --model cursor/gpt-5
-opencode run "decime hola" --model cursor/gpt-5.2
+opencode run "listame los archivos del repo" --model cursor/auto
 ```
 
-## How It Works
+## Notes
 
-- On startup, the plugin starts a local HTTP proxy on `127.0.0.1:32123`.
-- OpenCode uses `@ai-sdk/openai-compatible` against `http://127.0.0.1:32123/v1`.
-- The proxy translates `/v1/chat/completions` into a `cursor-agent` CLI call.
-
-## Current Limitations
-
-This integration is intentionally minimal and works well for plain chat/completions, but it does not currently provide:
-
-- **OpenCode tool-calling (LSP/TODO/tools):** `cursor-agent` is a CLI agent and does not speak OpenAI tool-calls, so OpenCode can’t route tool calls.
-- **Token usage / cost accounting:** `cursor-agent` does not expose token counts per request in a way OpenCode can consume.
-- **“Thinking” UI sections:** we only stream assistant text; there’s no separate reasoning payload.
-
-## Troubleshooting
-
-- `Unauthorized: cursor-agent failed.`: your model name is not supported by your `cursor-agent`. Try `cursor/gpt-5.2` or `cursor/auto`.
-- `Unable to connect`: another `opencode` instance might not have the proxy running, or the port `32123` is taken by something else. Try closing other `opencode` sessions, or change the port in both the plugin and `opencode.json`.
+- Tool-calling is experimental but works for built-in tools like `list`, `read`, `grep`, `bash`, `todowrite`.
+- Token usage/cost accounting and a dedicated “thinking” panel are not available via `cursor-agent`.
 
 ## License
 

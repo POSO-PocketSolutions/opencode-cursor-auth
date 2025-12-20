@@ -3,10 +3,23 @@ const CURSOR_PROVIDER_ID = "cursor";
 const CURSOR_PROXY_HOST = "127.0.0.1";
 const CURSOR_PROXY_DEFAULT_PORT = 32123;
 const CURSOR_PROXY_DEFAULT_BASE_URL = `http://${CURSOR_PROXY_HOST}:${CURSOR_PROXY_DEFAULT_PORT}/v1`;
+function openAIError(status, message, details) {
+    const body = {
+        error: {
+            message: details ? `${message}\n${details}` : message,
+            type: "cursor_agent_error",
+            param: null,
+            code: null,
+        },
+    };
+    return new Response(JSON.stringify(body), {
+        status,
+        headers: { "Content-Type": "application/json" },
+    });
+}
 function normalizeCursorAgentModel(model) {
     if (!model)
         return "auto";
-    // Aliases for convenience / opencode model IDs.
     const aliases = {
         "gpt-5": "gpt-5.2",
         "sonnet-4": "sonnet-4.5",
@@ -41,7 +54,6 @@ function extractPromptFromChatCompletions(body) {
             continue;
         }
         if (role === "assistant" && Array.isArray(message.tool_calls)) {
-            // In case OpenCode includes previous tool_calls.
             lines.push(`ASSISTANT TOOL_CALLS: ${JSON.stringify(message.tool_calls)}`);
             continue;
         }
@@ -50,7 +62,6 @@ function extractPromptFromChatCompletions(body) {
             lines.push(`${role.toUpperCase()}: ${content}`);
             continue;
         }
-        // Best-effort: OpenAI-style multi-part content
         if (Array.isArray(content)) {
             const textParts = content
                 .map((part) => {
@@ -69,7 +80,6 @@ function extractPromptFromChatCompletions(body) {
     return { prompt: lines.join("\n\n"), model, stream, tools };
 }
 function parseToolCallPlan(output) {
-    // Best-effort: find JSON object in the output.
     const start = output.indexOf("{");
     const end = output.lastIndexOf("}");
     if (start === -1 || end === -1 || end <= start)
@@ -94,20 +104,25 @@ function parseToolCallPlan(output) {
         return null;
     }
 }
-function buildToolCallingPrompt(conversation, tools) {
+function buildToolCallingPrompt(conversation, tools, workspaceDirectory) {
     const toolList = tools.length ? tools.map(summarizeTool).join("\n") : "(none)";
     return [
         "You are a tool-calling assistant running inside OpenCode.",
-        "You can call tools when needed to answer the user.",
+        `Workspace directory: ${workspaceDirectory}`,
         "",
         "Available tools:",
         toolList,
         "",
-        "IMPORTANT RESPONSE FORMAT:",
-        "Return ONLY one JSON object (no markdown, no extra text).",
-        "If you want to call tool(s):",
+        "RULES:",
+        "- If a tool can answer, prefer calling it.",
+        "- Use ONLY tool names from the list above.",
+        "- Use absolute paths when a tool expects a path.",
+        "- Return ONLY one JSON object. No markdown.",
+        "",
+        "RESPONSE FORMAT:",
+        "- Call tool(s):",
         '{"action":"tool_call","tool_calls":[{"name":"tool_name","arguments":{}}]}',
-        "If you want to answer the user directly:",
+        "- Final answer:",
         '{"action":"final","content":"..."}',
         "",
         "Conversation:",
@@ -157,67 +172,51 @@ async function ensureCursorProxyServer(workspaceDirectory) {
     // Mark as starting to avoid duplicate starts in-process.
     g[key] = { baseURL: "" };
     const handler = async (req) => {
-        const url = new URL(req.url);
-        if (url.pathname === "/health") {
-            return new Response(JSON.stringify({ ok: true }), {
-                status: 200,
-                headers: { "Content-Type": "application/json" },
-            });
-        }
-        if (url.pathname !== "/v1/chat/completions" && url.pathname !== "/chat/completions") {
-            return new Response(JSON.stringify({ error: `Unsupported path: ${url.pathname}` }), {
-                status: 404,
-                headers: { "Content-Type": "application/json" },
-            });
-        }
-        const body = await req.json().catch(() => ({}));
-        const { prompt, model, stream, tools } = extractPromptFromChatCompletions(body);
-        const selectedModel = normalizeCursorAgentModel(model);
-        // If tools are provided, ask cursor-agent to output a JSON plan (final vs tool_call).
-        const effectivePrompt = tools.length ? buildToolCallingPrompt(prompt, tools) : prompt;
-        // Note: cursor-agent expects the prompt as a positional arg.
-        // This is a best-effort adapter; we don’t currently support tool-calling.
-        const cmd = [
-            "cursor-agent",
-            "--print",
-            "--output-format",
-            "text",
-            "--workspace",
-            workspaceDirectory,
-            "--model",
-            selectedModel,
-            effectivePrompt,
-        ];
-        const bunAny = globalThis;
-        if (!bunAny.Bun?.spawn) {
-            return new Response(JSON.stringify({ error: "This provider requires Bun runtime." }), {
-                status: 500,
-                headers: { "Content-Type": "application/json" },
-            });
-        }
-        const child = bunAny.Bun.spawn({
-            cmd,
-            stdout: "pipe",
-            stderr: "pipe",
-            env: bunAny.Bun.env,
-        });
-        // Non-streaming: buffer stdout/stderr.
-        if (!stream) {
-            const [stdoutBytes, stderrBytes] = await Promise.all([
-                new Response(child.stdout).arrayBuffer(),
-                new Response(child.stderr).arrayBuffer(),
-            ]);
-            const stdout = new TextDecoder().decode(stdoutBytes).trim();
-            const stderr = new TextDecoder().decode(stderrBytes).trim();
-            if (child.exitCode !== 0) {
-                return new Response(JSON.stringify({ error: "cursor-agent failed.", details: stderr || stdout }), {
-                    status: 401,
+        try {
+            const url = new URL(req.url);
+            if (url.pathname === "/health") {
+                return new Response(JSON.stringify({ ok: true }), {
+                    status: 200,
                     headers: { "Content-Type": "application/json" },
                 });
             }
-            // Tool-calling support (non-streaming).
-            if (tools.length) {
-                const plan = parseToolCallPlan(stdout);
+            if (url.pathname !== "/v1/chat/completions" && url.pathname !== "/chat/completions") {
+                return openAIError(404, `Unsupported path: ${url.pathname}`);
+            }
+            const body = await req.json().catch(() => ({}));
+            const { prompt, model, stream, tools } = extractPromptFromChatCompletions(body);
+            const selectedModel = normalizeCursorAgentModel(model);
+            const effectivePrompt = tools.length ? buildToolCallingPrompt(prompt, tools, workspaceDirectory) : prompt;
+            const bunAny = globalThis;
+            if (!bunAny.Bun?.spawn) {
+                return openAIError(500, "This provider requires Bun runtime.");
+            }
+            const cmd = [
+                "cursor-agent",
+                "--print",
+                "--output-format",
+                "text",
+                "--workspace",
+                workspaceDirectory,
+                "--model",
+                selectedModel,
+                effectivePrompt,
+            ];
+            const child = bunAny.Bun.spawn({
+                cmd,
+                stdout: "pipe",
+                stderr: "pipe",
+                env: bunAny.Bun.env,
+            });
+            if (!stream) {
+                const [stdoutText, stderrText] = await Promise.all([
+                    new Response(child.stdout).text(),
+                    new Response(child.stderr).text(),
+                ]);
+                const stdout = (stdoutText || "").trim();
+                const stderr = (stderrText || "").trim();
+                // If tools were requested and we can parse a plan, treat it as success even if exitCode != 0.
+                const plan = tools.length ? parseToolCallPlan(stdout) : null;
                 if (plan?.action === "tool_call") {
                     const toolCalls = plan.tool_calls.map((tc, i) => ({
                         id: `call_${Date.now()}_${i}`,
@@ -256,106 +255,140 @@ async function ensureCursorProxyServer(workspaceDirectory) {
                         headers: { "Content-Type": "application/json" },
                     });
                 }
+                if (child.exitCode !== 0) {
+                    return openAIError(401, "cursor-agent failed.", stderr || stdout);
+                }
+                const payload = createChatCompletionResponse(selectedModel, stdout);
+                return new Response(JSON.stringify(payload), {
+                    status: 200,
+                    headers: { "Content-Type": "application/json" },
+                });
             }
-            const payload = createChatCompletionResponse(selectedModel, stdout);
-            return new Response(JSON.stringify(payload), {
-                status: 200,
-                headers: { "Content-Type": "application/json" },
-            });
-        }
-        const encoder = new TextEncoder();
-        const decoder = new TextDecoder();
-        const id = `cursor-agent-${Date.now()}`;
-        const created = Math.floor(Date.now() / 1000);
-        const sse = new ReadableStream({
-            async start(controller) {
-                try {
-                    // Tool-calling with streaming: buffer stdout, then emit tool_call or final chunks.
-                    if (tools.length) {
-                        const stdoutText = await new Response(child.stdout).text();
-                        const stderrText = await new Response(child.stderr).text();
+            // Streaming.
+            const encoder = new TextEncoder();
+            const id = `cursor-agent-${Date.now()}`;
+            const created = Math.floor(Date.now() / 1000);
+            const sse = new ReadableStream({
+                async start(controller) {
+                    try {
+                        // Tool-calling + streaming: buffer stdout to decide whether to emit tool_calls.
+                        if (tools.length) {
+                            // Keep the SSE connection alive while cursor-agent thinks.
+                            let closed = false;
+                            const heartbeat = () => {
+                                if (closed)
+                                    return;
+                                try {
+                                    const pingChunk = createChatCompletionChunk(id, created, selectedModel, "", false);
+                                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(pingChunk)}\n\n`));
+                                }
+                                catch {
+                                    // ignore
+                                }
+                            };
+                            heartbeat();
+                            const interval = setInterval(heartbeat, 1000);
+                            const [stdoutText, stderrText] = await Promise.all([
+                                new Response(child.stdout).text(),
+                                new Response(child.stderr).text(),
+                            ]).finally(() => {
+                                clearInterval(interval);
+                            });
+                            const stdout = (stdoutText || "").trim();
+                            const stderr = (stderrText || "").trim();
+                            const plan = parseToolCallPlan(stdout);
+                            if (plan?.action === "tool_call") {
+                                const toolCalls = plan.tool_calls.map((tc, i) => ({
+                                    index: i,
+                                    id: `call_${Date.now()}_${i}`,
+                                    type: "function",
+                                    function: {
+                                        name: tc.name,
+                                        arguments: JSON.stringify(tc.arguments ?? {}),
+                                    },
+                                }));
+                                const chunk = {
+                                    id,
+                                    object: "chat.completion.chunk",
+                                    created,
+                                    model: selectedModel,
+                                    choices: [
+                                        {
+                                            index: 0,
+                                            delta: {
+                                                role: "assistant",
+                                                tool_calls: toolCalls,
+                                            },
+                                            finish_reason: "tool_calls",
+                                        },
+                                    ],
+                                };
+                                controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                                controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                                return;
+                            }
+                            const content = plan?.action === "final" ? plan.content : stdout;
+                            if (child.exitCode !== 0 && !plan) {
+                                const err = openAIError(401, "cursor-agent failed.", stderr || stdout);
+                                const errText = await err.text();
+                                // Emit as assistant content to avoid schema validation failures in SSE mode.
+                                const msg = `cursor-agent failed: ${errText}`;
+                                const finalChunk = createChatCompletionChunk(id, created, selectedModel, msg, true);
+                                controller.enqueue(encoder.encode(`data: ${JSON.stringify(finalChunk)}\n\n`));
+                                controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                                return;
+                            }
+                            const finalChunk = createChatCompletionChunk(id, created, selectedModel, content, true);
+                            controller.enqueue(encoder.encode(`data: ${JSON.stringify(finalChunk)}\n\n`));
+                            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                            return;
+                        }
+                        // No tools: stream stdout as text deltas.
+                        const decoder = new TextDecoder();
+                        const reader = child.stdout.getReader();
+                        while (true) {
+                            const { value, done } = await reader.read();
+                            if (done)
+                                break;
+                            if (!value || value.length === 0)
+                                continue;
+                            const text = decoder.decode(value, { stream: true });
+                            if (!text)
+                                continue;
+                            const chunk = createChatCompletionChunk(id, created, selectedModel, text, false);
+                            controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                        }
                         if (child.exitCode !== 0) {
-                            const errChunk = { error: "cursor-agent failed.", details: stderrText || stdoutText };
+                            const stderrText = await new Response(child.stderr).text();
+                            const msg = `cursor-agent failed: ${(stderrText || "").trim()}`;
+                            const errChunk = createChatCompletionChunk(id, created, selectedModel, msg, true);
                             controller.enqueue(encoder.encode(`data: ${JSON.stringify(errChunk)}\n\n`));
                             controller.enqueue(encoder.encode("data: [DONE]\n\n"));
                             return;
                         }
-                        const plan = parseToolCallPlan(stdoutText.trim());
-                        if (plan?.action === "tool_call") {
-                            const toolCalls = plan.tool_calls.map((tc, i) => ({
-                                index: i,
-                                id: `call_${Date.now()}_${i}`,
-                                type: "function",
-                                function: {
-                                    name: tc.name,
-                                    arguments: JSON.stringify(tc.arguments ?? {}),
-                                },
-                            }));
-                            const chunk = {
-                                id,
-                                object: "chat.completion.chunk",
-                                created,
-                                model: selectedModel,
-                                choices: [
-                                    {
-                                        index: 0,
-                                        delta: {
-                                            role: "assistant",
-                                            tool_calls: toolCalls,
-                                        },
-                                        finish_reason: "tool_calls",
-                                    },
-                                ],
-                            };
-                            controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-                            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-                            return;
-                        }
-                        const content = plan?.action === "final" ? plan.content : stdoutText.trim();
-                        const chunk = createChatCompletionChunk(id, created, selectedModel, content, true);
-                        controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                        const doneChunk = createChatCompletionChunk(id, created, selectedModel, "", true);
+                        controller.enqueue(encoder.encode(`data: ${JSON.stringify(doneChunk)}\n\n`));
                         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-                        return;
                     }
-                    // Streaming (no tools): forward stdout incrementally.
-                    const reader = child.stdout.getReader();
-                    while (true) {
-                        const { value, done } = await reader.read();
-                        if (done)
-                            break;
-                        if (!value || value.length === 0)
-                            continue;
-                        const text = decoder.decode(value, { stream: true });
-                        if (text) {
-                            const chunk = createChatCompletionChunk(id, created, selectedModel, text, false);
-                            controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-                        }
+                    finally {
+                        closed = true;
+                        controller.close();
                     }
-                    if (child.exitCode !== 0) {
-                        const stderrText = await new Response(child.stderr).text();
-                        const errChunk = {
-                            error: "cursor-agent failed.",
-                            details: stderrText,
-                        };
-                        controller.enqueue(encoder.encode(`data: ${JSON.stringify(errChunk)}\n\n`));
-                    }
-                    const doneChunk = createChatCompletionChunk(id, created, selectedModel, "", true);
-                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(doneChunk)}\n\n`));
-                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-                }
-                finally {
-                    controller.close();
-                }
-            },
-        });
-        return new Response(sse, {
-            status: 200,
-            headers: {
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                Connection: "keep-alive",
-            },
-        });
+                },
+            });
+            return new Response(sse, {
+                status: 200,
+                headers: {
+                    "Content-Type": "text/event-stream",
+                    "Cache-Control": "no-cache",
+                    Connection: "keep-alive",
+                },
+            });
+        }
+        catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return openAIError(500, "Proxy error", message);
+        }
     };
     const bunAny = globalThis;
     if (typeof bunAny.Bun !== "undefined" && typeof bunAny.Bun.serve === "function") {
@@ -414,7 +447,6 @@ export const CursorAuthPlugin = async ({ $, directory }) => {
         auth: {
             provider: CURSOR_PROVIDER_ID,
             async loader(_getAuth) {
-                // Loader isn't used to override the AI SDK transport.
                 return {};
             },
             methods: [
@@ -436,7 +468,6 @@ export const CursorAuthPlugin = async ({ $, directory }) => {
                         }
                         return {
                             type: "success",
-                            // Sentinel key (OpenCode expects an API key).
                             key: "cursor-agent",
                         };
                     },
@@ -447,9 +478,8 @@ export const CursorAuthPlugin = async ({ $, directory }) => {
             if (input.model.providerID !== CURSOR_PROVIDER_ID) {
                 return;
             }
-            // Ensure AI SDK has a base URL to build request URLs.
+            // Always point to the actual proxy base URL (may be dynamically allocated).
             output.options.baseURL = proxyBaseURL;
-            // apiKey is required by the OpenAI-compatible provider, but not used by our proxy.
             output.options.apiKey = output.options.apiKey || "cursor-agent";
         },
     };

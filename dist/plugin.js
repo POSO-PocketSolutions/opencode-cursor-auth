@@ -3,6 +3,16 @@ const CURSOR_PROVIDER_ID = "cursor";
 const CURSOR_PROXY_HOST = "127.0.0.1";
 const CURSOR_PROXY_PORT = 32123;
 const CURSOR_PROXY_BASE_URL = `http://${CURSOR_PROXY_HOST}:${CURSOR_PROXY_PORT}/v1`;
+function normalizeCursorAgentModel(model) {
+    if (!model)
+        return "auto";
+    // Aliases for convenience / opencode model IDs.
+    const aliases = {
+        "gpt-5": "gpt-5.2",
+        "sonnet-4": "sonnet-4.5",
+    };
+    return aliases[model] || model;
+}
 function extractPromptFromChatCompletions(body) {
     const model = typeof body?.model === "string" ? body.model : undefined;
     const stream = body?.stream === true;
@@ -70,7 +80,7 @@ async function ensureCursorProxyServer($, workspaceDirectory) {
         }
         const body = await req.json().catch(() => ({}));
         const { prompt, model, stream } = extractPromptFromChatCompletions(body);
-        const selectedModel = model || "gpt-5";
+        const selectedModel = normalizeCursorAgentModel(model);
         const command = $ `cursor-agent --print --output-format text --workspace ${workspaceDirectory} --model ${selectedModel} ${prompt}`
             .quiet()
             .nothrow();

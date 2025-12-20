@@ -1,5 +1,8 @@
 const CURSOR_PROVIDER_ID = "cursor";
-const CURSOR_AGENT_BASE_URL = "http://cursor-agent.local";
+// Local proxy server that translates OpenAI-compatible HTTP to cursor-agent CLI.
+const CURSOR_PROXY_HOST = "127.0.0.1";
+const CURSOR_PROXY_PORT = 32123;
+const CURSOR_PROXY_BASE_URL = `http://${CURSOR_PROXY_HOST}:${CURSOR_PROXY_PORT}/v1`;
 function extractPromptFromChatCompletions(body) {
     const model = typeof body?.model === "string" ? body.model : undefined;
     const stream = body?.stream === true;
@@ -47,29 +50,28 @@ function createChatCompletionResponse(model, content) {
         ],
     };
 }
-export const CursorAuthPlugin = async ({ $, directory }) => {
-    const cursorFetch = async (input, init) => {
-        const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-        const path = (() => {
-            try {
-                return new URL(url).pathname;
-            }
-            catch {
-                return url;
-            }
-        })();
-        // Minimal: emulate OpenAI chat.completions via cursor-agent CLI.
-        if (!path.endsWith("/v1/chat/completions") && !path.endsWith("/chat/completions")) {
-            return new Response(JSON.stringify({ error: `Unsupported endpoint for cursor-agent backend: ${path}` }), {
-                status: 400,
+function getGlobalKey() {
+    return "__opencode_cursor_proxy_server__";
+}
+async function ensureCursorProxyServer($, workspaceDirectory) {
+    const key = getGlobalKey();
+    const g = globalThis;
+    if (g[key]?.started) {
+        return;
+    }
+    g[key] = { started: true };
+    const handler = async (req) => {
+        const url = new URL(req.url);
+        if (url.pathname !== "/v1/chat/completions" && url.pathname !== "/chat/completions") {
+            return new Response(JSON.stringify({ error: `Unsupported path: ${url.pathname}` }), {
+                status: 404,
                 headers: { "Content-Type": "application/json" },
             });
         }
-        const bodyText = typeof init?.body === "string" ? init.body : "{}";
-        const body = JSON.parse(bodyText);
+        const body = await req.json().catch(() => ({}));
         const { prompt, model, stream } = extractPromptFromChatCompletions(body);
         const selectedModel = model || "gpt-5";
-        const command = $ `cursor-agent --print --output-format text --workspace ${directory} --model ${selectedModel} ${prompt}`
+        const command = $ `cursor-agent --print --output-format text --workspace ${workspaceDirectory} --model ${selectedModel} ${prompt}`
             .quiet()
             .nothrow();
         const result = await command;
@@ -77,7 +79,7 @@ export const CursorAuthPlugin = async ({ $, directory }) => {
         const stderr = result.stderr.toString();
         if (result.exitCode !== 0) {
             return new Response(JSON.stringify({
-                error: "cursor-agent failed. Run `cursor-agent login` (or `opencode auth login` -> cursor) and try again.",
+                error: "cursor-agent failed.",
                 details: stderr || stdout,
             }), { status: 401, headers: { "Content-Type": "application/json" } });
         }
@@ -88,7 +90,6 @@ export const CursorAuthPlugin = async ({ $, directory }) => {
                 headers: { "Content-Type": "application/json" },
             });
         }
-        // Very simple SSE stream: emit one delta then DONE.
         const encoder = new TextEncoder();
         const sse = new ReadableStream({
             start(controller) {
@@ -118,6 +119,26 @@ export const CursorAuthPlugin = async ({ $, directory }) => {
                 Connection: "keep-alive",
             },
         });
+    };
+    if (typeof globalThis.Bun !== "undefined" && typeof globalThis.Bun.serve === "function") {
+        globalThis.Bun.serve({
+            hostname: CURSOR_PROXY_HOST,
+            port: CURSOR_PROXY_PORT,
+            fetch: handler,
+        });
+        return;
+    }
+    // Fallback (shouldn't happen inside opencode, which runs Bun).
+    throw new Error("Cursor proxy server requires Bun runtime");
+}
+export const CursorAuthPlugin = async ({ $, directory }) => {
+    await ensureCursorProxyServer($, directory);
+    // We still provide a fetch override (best-effort), but the primary integration is the local HTTP proxy.
+    const cursorFetch = async (input, init) => {
+        const urlString = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        const url = new URL(urlString);
+        const target = new URL(url.pathname, CURSOR_PROXY_BASE_URL);
+        return fetch(target, init);
     };
     return {
         auth: {
@@ -156,7 +177,7 @@ export const CursorAuthPlugin = async ({ $, directory }) => {
                 return;
             }
             // Ensure AI SDK has a base URL to build request URLs.
-            output.options.baseURL = output.options.baseURL || `${CURSOR_AGENT_BASE_URL}/v1`;
+            output.options.baseURL = output.options.baseURL || CURSOR_PROXY_BASE_URL;
             // Override transport so we call cursor-agent instead of HTTP.
             output.options.fetch = cursorFetch;
             // apiKey is required by the OpenAI-compatible provider, but not used by cursorFetch.

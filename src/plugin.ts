@@ -153,19 +153,17 @@ function buildToolCallingPrompt(conversation: string, tools: ToolDef[], workspac
     "Available tools:",
     toolList,
     "",
-    "RULES:",
-    "- If a tool can answer, prefer calling it.",
-    "- Use ONLY tool names from the list above.",
-    "- Use absolute paths when a tool expects a path.",
-    "- Return ONLY one JSON object. No markdown.",
+    "STRICT OUTPUT:",
+    "- Output MUST be exactly one JSON object and nothing else.",
+    "- If you output anything outside JSON, your answer is discarded.",
     "",
     "RESPONSE FORMAT:",
     "- Call tool(s):",
-    '{"action":"tool_call","tool_calls":[{"name":"tool_name","arguments":{}}]}',
+    '{"action":"tool_call","tool_calls":[{"name":"list","arguments":{"path":"/ABSOLUTE/PATH"}}]}',
     "- Final answer:",
     '{"action":"final","content":"..."}',
     "",
-    "Conversation:",
+    "Task:",
     conversation,
   ].join("\n");
 }
@@ -235,7 +233,12 @@ async function ensureCursorProxyServer(workspaceDirectory: string): Promise<stri
 
       const body = await req.json().catch(() => ({}));
       const { prompt, model, stream, tools } = extractPromptFromChatCompletions(body);
-      const selectedModel = normalizeCursorAgentModel(model);
+      let selectedModel = normalizeCursorAgentModel(model);
+
+      // When tool-calling is enabled and model is "auto", pick a strict model.
+      if (tools.length && selectedModel === "auto") {
+        selectedModel = "sonnet-4.5-thinking";
+      }
 
       const effectivePrompt = tools.length ? buildToolCallingPrompt(prompt, tools, workspaceDirectory) : prompt;
 
@@ -316,11 +319,13 @@ async function ensureCursorProxyServer(workspaceDirectory: string): Promise<stri
           });
         }
 
-        if (child.exitCode !== 0) {
-          return openAIError(401, "cursor-agent failed.", stderr || stdout);
+        // cursor-agent sometimes returns non-zero even with usable stdout.
+        // Treat stdout as success unless we have explicit stderr.
+        if (child.exitCode !== 0 && stderr.length > 0) {
+          return openAIError(401, "cursor-agent failed.", stderr);
         }
 
-        const payload = createChatCompletionResponse(selectedModel, stdout);
+        const payload = createChatCompletionResponse(selectedModel, stdout || stderr);
         return new Response(JSON.stringify(payload), {
           status: 200,
           headers: { "Content-Type": "application/json" },
@@ -397,10 +402,8 @@ async function ensureCursorProxyServer(workspaceDirectory: string): Promise<stri
 
               const content = plan?.action === "final" ? plan.content : stdout;
               if (child.exitCode !== 0 && !plan) {
-                const err = openAIError(401, "cursor-agent failed.", stderr || stdout);
-                const errText = await err.text();
-                // Emit as assistant content to avoid schema validation failures in SSE mode.
-                const msg = `cursor-agent failed: ${errText}`;
+                // Don't fail hard if stdout is usable; emit it as final content.
+                const msg = stdout || stderr;
                 const finalChunk = createChatCompletionChunk(id, created, selectedModel, msg, true);
                 controller.enqueue(encoder.encode(`data: ${JSON.stringify(finalChunk)}\n\n`));
                 controller.enqueue(encoder.encode("data: [DONE]\n\n"));

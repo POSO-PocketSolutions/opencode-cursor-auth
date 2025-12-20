@@ -5,8 +5,8 @@ const CURSOR_PROVIDER_ID = "cursor";
 
 // Local proxy server that translates OpenAI-compatible HTTP to cursor-agent CLI.
 const CURSOR_PROXY_HOST = "127.0.0.1";
-const CURSOR_PROXY_PORT = 32123;
-const CURSOR_PROXY_BASE_URL = `http://${CURSOR_PROXY_HOST}:${CURSOR_PROXY_PORT}/v1`;
+const CURSOR_PROXY_DEFAULT_PORT = 32123;
+const CURSOR_PROXY_DEFAULT_BASE_URL = `http://${CURSOR_PROXY_HOST}:${CURSOR_PROXY_DEFAULT_PORT}/v1`;
 
 function normalizeCursorAgentModel(model?: string): string {
   if (!model) return "auto";
@@ -189,14 +189,17 @@ function getGlobalKey(): string {
   return "__opencode_cursor_proxy_server__";
 }
 
-async function ensureCursorProxyServer(workspaceDirectory: string): Promise<void> {
+async function ensureCursorProxyServer(workspaceDirectory: string): Promise<string> {
   const key = getGlobalKey();
   const g = globalThis as any;
-  if (g[key]?.started) {
-    return;
+
+  const existingBaseURL = g[key]?.baseURL;
+  if (typeof existingBaseURL === "string" && existingBaseURL.length > 0) {
+    return existingBaseURL;
   }
 
-  g[key] = { started: true };
+  // Mark as starting to avoid duplicate starts in-process.
+  g[key] = { baseURL: "" };
 
   const handler = async (req: Request): Promise<Response> => {
     const url = new URL(req.url);
@@ -424,31 +427,54 @@ async function ensureCursorProxyServer(workspaceDirectory: string): Promise<void
     });
   };
 
-  if (typeof (globalThis as any).Bun !== "undefined" && typeof (globalThis as any).Bun.serve === "function") {
-    // If another opencode instance already started the proxy, reuse it.
+  const bunAny = globalThis as any;
+  if (typeof bunAny.Bun !== "undefined" && typeof bunAny.Bun.serve === "function") {
+    // If another process already started a proxy on the default port, reuse it.
     try {
-      const res = await fetch(`http://${CURSOR_PROXY_HOST}:${CURSOR_PROXY_PORT}/health`).catch(() => null);
+      const res = await fetch(`http://${CURSOR_PROXY_HOST}:${CURSOR_PROXY_DEFAULT_PORT}/health`).catch(() => null);
       if (res && res.ok) {
-        return;
+        g[key].baseURL = CURSOR_PROXY_DEFAULT_BASE_URL;
+        return CURSOR_PROXY_DEFAULT_BASE_URL;
       }
     } catch {
       // ignore
     }
 
-    try {
-      (globalThis as any).Bun.serve({
+    const startServer = (port: number) => {
+      return bunAny.Bun.serve({
         hostname: CURSOR_PROXY_HOST,
-        port: CURSOR_PROXY_PORT,
+        port,
         fetch: handler,
       });
-      return;
+    };
+
+    try {
+      const server = startServer(CURSOR_PROXY_DEFAULT_PORT);
+      const baseURL = `http://${CURSOR_PROXY_HOST}:${server.port}/v1`;
+      g[key].baseURL = baseURL;
+      return baseURL;
     } catch (error) {
       const code = (error as any)?.code;
-      if (code === "EADDRINUSE") {
-        // Assume an existing proxy is running.
-        return;
+      if (code !== "EADDRINUSE") {
+        throw error;
       }
-      throw error;
+
+      // Something is already bound to the default port. Only reuse it if it looks like our proxy.
+      try {
+        const res = await fetch(`http://${CURSOR_PROXY_HOST}:${CURSOR_PROXY_DEFAULT_PORT}/health`).catch(() => null);
+        if (res && res.ok) {
+          g[key].baseURL = CURSOR_PROXY_DEFAULT_BASE_URL;
+          return CURSOR_PROXY_DEFAULT_BASE_URL;
+        }
+      } catch {
+        // ignore
+      }
+
+      // Fallback: start on a random free port.
+      const server = startServer(0);
+      const baseURL = `http://${CURSOR_PROXY_HOST}:${server.port}/v1`;
+      g[key].baseURL = baseURL;
+      return baseURL;
     }
   }
 
@@ -456,7 +482,7 @@ async function ensureCursorProxyServer(workspaceDirectory: string): Promise<void
 }
 
 export const CursorAuthPlugin: Plugin = async ({ $, directory }: PluginInput) => {
-  await ensureCursorProxyServer(directory);
+  const proxyBaseURL = await ensureCursorProxyServer(directory);
 
   return {
     auth: {
@@ -500,7 +526,7 @@ export const CursorAuthPlugin: Plugin = async ({ $, directory }: PluginInput) =>
       }
 
       // Ensure AI SDK has a base URL to build request URLs.
-      output.options.baseURL = output.options.baseURL || CURSOR_PROXY_BASE_URL;
+      output.options.baseURL = proxyBaseURL;
       // apiKey is required by the OpenAI-compatible provider, but not used by our proxy.
       output.options.apiKey = output.options.apiKey || "cursor-agent";
     },

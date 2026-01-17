@@ -8,12 +8,16 @@ This plugin is for people who pay for Cursor (or have it paid for them) and want
 
 - An active **Cursor Pro** subscription (or equivalent) so `cursor-agent` can access models.
 - `cursor-agent` installed.
+- `bun` installed.
 
 ## Install cursor-agent (macOS/Linux)
 
 ```bash
 curl -fsS https://cursor.com/install | bash
 ```
+## Install bun (macOS/Linux)
+
+`curl -fsSL https://bun.sh/install | bash`
 
 ## Install
 
